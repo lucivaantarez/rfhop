@@ -16,7 +16,7 @@
 
 shopt -s checkwinsize 2>/dev/null
 
-VERSION="2.1.1"
+VERSION="2.1.2"
 NSLOTS=20
 
 CONF_DIR="$HOME/.rfhop"
@@ -65,9 +65,9 @@ fit(){
   w=$( { stty size; } 2>/dev/null | awk '{print $2}' )
   case "$w" in ''|*[!0-9]*) w=${COLUMNS:-} ;; esac
   case "$w" in ''|*[!0-9]*) w=$(tput cols 2>/dev/null) ;; esac
-  case "$w" in ''|*[!0-9]*) w=48 ;; esac
+  case "$w" in ''|*[!0-9]*) w=80 ;; esac
   W=$w
-  [ "$W" -gt 72 ] && W=72
+  [ "$W" -gt 200 ] && W=200
   [ "$W" -lt 24 ] && W=24
   RULE=$(printf '─%.0s' $(seq 1 "$W"))
 }
@@ -98,7 +98,7 @@ emit(){
 }
 # emit a printf-formatted line (truncated): el 'FMT' args...
 el(){ local fmt=$1; shift; emit "$(printf "$fmt" "$@")"; }
-clr(){ printf '\033[3J\033[H\033[2J\033[?7l'; }
+clr(){ [ -t 1 ] && stty opost onlcr 2>/dev/null; printf '\033[3J\033[H\033[2J\033[?7l'; }
 hide_cursor(){ printf '\033[?25l'; }
 show_cursor(){ printf '\033[?25h'; }
 cook(){ [ -t 0 ] && stty sane 2>/dev/null; [ -t 1 ] && printf '\033[?7h'; return 0; }
@@ -233,12 +233,13 @@ launch_clone(){            # $1=pkg $2=url  -> 0 ok / 1 failed
   cmd=${cmd//%URL%/$2}
   LAST_OUT=$(su -c "$cmd" 2>&1)
   local rc=$?
+  [ -t 1 ] && stty opost onlcr 2>/dev/null   # am/app_process flips opost off -> restore CR mapping
   if [ $rc -ne 0 ] || printf '%s' "$LAST_OUT" | grep -qiE 'Error type|does not exist|Exception'; then
     return 1
   fi
   return 0
 }
-stop_clone(){ su -c "am force-stop $1" >/dev/null 2>&1; }
+stop_clone(){ su -c "am force-stop $1" >/dev/null 2>&1; [ -t 1 ] && stty opost onlcr 2>/dev/null; }
 
 # ---- log ring --------------------------------------------------------------
 LOG=()
@@ -252,6 +253,8 @@ print_log_line(){
   local e=$1 ts lvl msg col
   ts=${e%%|*}; e=${e#*|}; lvl=${e%%|*}; msg=${e#*|}
   case $lvl in INFO) col=$C_GRN;; DEBU) col=$C_PUR;; WARN) col=$C_YEL;; ERRO) col=$C_RED;; FATA) col=$C_MAG;; *) col=$C_TXT;; esac
+  local mw=$(( W - 14 )); [ "$mw" -lt 8 ] && mw=8   # prefix = space+ts(7)+space+lvl(4)+space
+  msg=$(trunc "$msg" "$mw")
   printf ' %s%-7s%s %s%s%-4s%s %s%s%s\n' \
     "$C_TS" "$ts" "$C_RESET" "$col" "$B" "$lvl" "$C_RESET" "$C_TXT" "$msg" "$C_RESET"
 }
