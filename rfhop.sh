@@ -16,7 +16,7 @@
 
 shopt -s checkwinsize 2>/dev/null
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 NSLOTS=20
 
 CONF_DIR="$HOME/.rfhop"
@@ -28,6 +28,7 @@ C2_PKG=""
 C1_SLOT=1
 C2_SLOT=2
 MASTER="$CONF_DIR/links.txt"
+REPO_RAW="https://raw.githubusercontent.com/lucivaantarez/rfhop/main"   # for option 3 link sync
 SPLIT_MODE="auto"          # auto | fixed
 CHUNK=50                   # only used when SPLIT_MODE=fixed
 LOAD_WAIT=20               # seconds to settle after launch
@@ -58,19 +59,49 @@ else
 fi
 
 # ---- terminal helpers ------------------------------------------------------
-W=50; RULE=""
+W=40; RULE=""
 fit(){
-  local w=${COLUMNS:-0}
-  if [ "${w:-0}" -le 0 ] 2>/dev/null; then w=$(tput cols 2>/dev/null || echo 50); fi
+  local w=""
+  w=$( { stty size; } 2>/dev/null | awk '{print $2}' )
+  case "$w" in ''|*[!0-9]*) w=${COLUMNS:-} ;; esac
+  case "$w" in ''|*[!0-9]*) w=$(tput cols 2>/dev/null) ;; esac
+  case "$w" in ''|*[!0-9]*) w=48 ;; esac
   W=$w
-  [ "$W" -gt 56 ] 2>/dev/null && W=56
-  [ "$W" -lt 30 ] 2>/dev/null && W=30
+  [ "$W" -gt 72 ] && W=72
+  [ "$W" -lt 24 ] && W=24
   RULE=$(printf '─%.0s' $(seq 1 "$W"))
 }
-clr(){ printf '\033[H\033[2J'; }
+# Print one line truncated to W visible columns. ANSI-escape aware (escapes
+# don't count) and UTF-8 aware (multibyte glyph = 1 column, never split).
+# Forces byte-wise slicing via LC_ALL=C so it is correct regardless of locale.
+emit(){
+  local LC_ALL=C
+  local s=$1 out= vis=0 i=0 n=${#1} b code
+  while [ "$i" -lt "$n" ]; do
+    [ "$vis" -ge "$W" ] && break
+    b=${s:i:1}
+    if [ "$b" = $'\033' ]; then
+      out+=$b; i=$((i+1))
+      while [ "$i" -lt "$n" ]; do b=${s:i:1}; out+=$b; i=$((i+1)); case $b in [a-zA-Z]) break;; esac; done
+      continue
+    fi
+    out+=$b; i=$((i+1))
+    printf -v code '%d' "'$b" 2>/dev/null || code=0
+    if [ "$code" -ge 192 ]; then
+      while [ "$i" -lt "$n" ]; do b=${s:i:1}; printf -v code '%d' "'$b" 2>/dev/null || code=0
+        if [ "$code" -ge 128 ] && [ "$code" -lt 192 ]; then out+=$b; i=$((i+1)); else break; fi
+      done
+    fi
+    vis=$((vis+1))
+  done
+  printf '%s%s\n' "$out" "$C_RESET"
+}
+# emit a printf-formatted line (truncated): el 'FMT' args...
+el(){ local fmt=$1; shift; emit "$(printf "$fmt" "$@")"; }
+clr(){ printf '\033[3J\033[H\033[2J\033[?7l'; }
 hide_cursor(){ printf '\033[?25l'; }
 show_cursor(){ printf '\033[?25h'; }
-cook(){ [ -t 0 ] && stty sane 2>/dev/null; return 0; }
+cook(){ [ -t 0 ] && stty sane 2>/dev/null; [ -t 1 ] && printf '\033[?7h'; return 0; }
 rule(){ printf '%s%s%s\n' "$C_RULE" "$RULE" "$C_RESET"; }
 flash(){ printf '\n %s%s%s\n' "$C_DIM" "$1" "$C_RESET"; sleep 1; }
 
@@ -140,6 +171,23 @@ reload_master(){
     MASTER_LINKS+=("$line")
   done < "$MASTER"
   MASTER_N=${#MASTER_LINKS[@]}
+}
+
+# option 3: pull the latest links.txt from the repo, then reload (offline-safe)
+update_links(){
+  printf '\n %ssyncing links from repo...%s\n' "$C_DIM" "$C_RESET"
+  local tmp; tmp="$(mktemp 2>/dev/null)"; [ -n "$tmp" ] || tmp="$CONF_DIR/.lpull"
+  if curl -fsSL "$REPO_RAW/links.txt" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mkdir -p "$(dirname "$MASTER")"
+    if [ ! -f "$MASTER" ] || ! cmp -s "$tmp" "$MASTER"; then
+      cp "$tmp" "$MASTER"; reload_master; flash "links updated: $MASTER_N"
+    else
+      reload_master; flash "already latest: $MASTER_N"
+    fi
+  else
+    reload_master; flash "offline - local links: $MASTER_N"
+  fi
+  rm -f "$tmp"
 }
 
 # sets RS RE = 1-based inclusive range for a slot, or 0 0 if empty
@@ -234,7 +282,7 @@ render_home(){
   rule
   printf ' %s%s1%s  %sstart hopping%s\n'  "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "$C_RESET"
   printf ' %s%s2%s  %ssettings%s\n'       "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "$C_RESET"
-  printf ' %s%s3%s  %sreload links%s\n'   "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "$C_RESET"
+  printf ' %s%s3%s  %supdate links%s\n'   "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "$C_RESET"
   printf ' %s%s0%s  %sexit%s\n'           "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "$C_RESET"
   rule
   printf ' %sselect 1-3 / 0%s ' "$C_DIM" "$C_RESET"
@@ -503,7 +551,7 @@ main(){
     case $k in
       1) run_loop ;;
       2) screen_settings ;;
-      3) reload_master; flash "links reloaded: $MASTER_N" ;;
+      3) update_links ;;
       0|q|Q) clr; show_cursor; exit 0 ;;
     esac
   done
