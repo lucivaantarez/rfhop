@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================================
 #  rfhop  v2.1.0   —   Saturnity Roblox private-server hopper (Redfinger)
-#  Rooted Redfinger, App Cloner Roblox clones, 2 clones per device.
+#  Rooted Redfinger, App Cloner Roblox clones, up to 3 clones per device.
 #  Time-based hopping (container isolation blocks process detection).
 #
 #  This build:
@@ -16,24 +16,32 @@
 
 shopt -s checkwinsize 2>/dev/null
 
-VERSION="2.1.2"
-NSLOTS=20
+VERSION="2.7.0"
+NSLOTS=40
 
 CONF_DIR="$HOME/.rfhop"
 CONF="$CONF_DIR/config"
 
 # ---- defaults (overridden by config) --------------------------------------
-C1_PKG=""
-C2_PKG=""
-C1_SLOT=1
-C2_SLOT=2
+NCLONES=4                  # clones per device; leave a clone's package blank to skip it
+C1_PKG="com.roblox.clienv"; C2_PKG="com.roblox.clienx"; C3_PKG="com.roblox.clienw"; C4_PKG="com.roblox.clieny"; C5_PKG=""; C6_PKG=""
+C1_SLOT=1; C2_SLOT=2; C3_SLOT=3; C4_SLOT=4; C5_SLOT=5; C6_SLOT=6
+pkg_of(){  local v="C${1}_PKG";  printf '%s' "${!v}"; }
+slot_of(){ local v="C${1}_SLOT"; printf '%s' "${!v}"; }
 MASTER="$CONF_DIR/links.txt"
-REPO_RAW="https://raw.githubusercontent.com/lucivaantarez/rfhop/main"   # for option 3 link sync
+REPO_RAW="https://raw.githubusercontent.com/lucivaantarez/rfhop/main"   # script self-update base
+# per-device link source (raw GitHub). Default = your repo's links.txt; other users point this at their own raw file.
+LINKS_URL="https://raw.githubusercontent.com/lucivaantarez/rfhop/main/links.txt"
+# --- discord dashboard reporting ---
+REPORT="off"               # on = send state to the worker
+DEVICE_NAME=""             # this device label on the dashboard, e.g. RF01
+REPORT_URL=""              # your worker /report endpoint
+SQLITE="/data/data/com.termux/files/usr/bin/sqlite3"
 SPLIT_MODE="auto"          # auto | fixed
 CHUNK=50                   # only used when SPLIT_MODE=fixed
 LOAD_WAIT=20               # seconds to settle after launch
 HOLD_TIME=180              # seconds to stay in a server
-STAGGER=100                # seconds clone2 starts behind clone1
+STAGGER=100                # seconds each clone starts behind the previous
 LAUNCH_TMPL="am start -n %PKG%/com.roblox.client.ActivityProtocolLaunch -d '%URL%'"
 WAKELOCK="on"
 TERMUX_API="off"
@@ -121,6 +129,7 @@ hdr(){
 
 fmt_dur(){ local s=$1; if [ $s -ge 60 ]; then printf '%dm%02ds' $((s/60)) $((s%60)); else printf '%ds' $s; fi; }
 fmt_up(){ local s=$1; printf '%dh%02dm' $((s/3600)) $(( (s%3600)/60 )); }
+fmt_clock(){ date -d "@$1" +'%-I:%M%p' 2>/dev/null || date -r "$1" +'%-I:%M%p' 2>/dev/null || printf '--'; }
 trunc(){ local s=$1 n=$2; if [ ${#s} -gt $n ]; then printf '%s..' "${s:0:$((n-2))}"; else printf '%s' "$s"; fi; }
 now(){ date +%s; }
 
@@ -135,9 +144,13 @@ load_cfg(){
   local k v
   while IFS='=' read -r k v; do
     case $k in
-      c1_pkg) C1_PKG=$v;;  c2_pkg) C2_PKG=$v;;
-      c1_slot) C1_SLOT=$v;; c2_slot) C2_SLOT=$v;;
+      c1_pkg) C1_PKG=$v;;  c2_pkg) C2_PKG=$v;;  c3_pkg) C3_PKG=$v;;
+      c4_pkg) C4_PKG=$v;;  c5_pkg) C5_PKG=$v;;  c6_pkg) C6_PKG=$v;;
+      c1_slot) C1_SLOT=$v;; c2_slot) C2_SLOT=$v;; c3_slot) C3_SLOT=$v;;
+      c4_slot) C4_SLOT=$v;; c5_slot) C5_SLOT=$v;; c6_slot) C6_SLOT=$v;;
       master) MASTER=$v;;  split_mode) SPLIT_MODE=$v;;
+      links_url) LINKS_URL=$v;;
+      report) REPORT=$v;; device_name) DEVICE_NAME=$v;; report_url) REPORT_URL=$v;;
       chunk) CHUNK=$v;;    load_wait) LOAD_WAIT=$v;;
       hold_time) HOLD_TIME=$v;; stagger) STAGGER=$v;;
       launch_tmpl) LAUNCH_TMPL=$v;;
@@ -148,9 +161,12 @@ load_cfg(){
 save_cfg(){
   mkdir -p "$CONF_DIR"
   {
-    echo "c1_pkg=$C1_PKG";   echo "c2_pkg=$C2_PKG"
-    echo "c1_slot=$C1_SLOT"; echo "c2_slot=$C2_SLOT"
-    echo "master=$MASTER";   echo "split_mode=$SPLIT_MODE"
+    echo "c1_pkg=$C1_PKG";   echo "c2_pkg=$C2_PKG";   echo "c3_pkg=$C3_PKG"
+    echo "c4_pkg=$C4_PKG";   echo "c5_pkg=$C5_PKG";   echo "c6_pkg=$C6_PKG"
+    echo "c1_slot=$C1_SLOT"; echo "c2_slot=$C2_SLOT"; echo "c3_slot=$C3_SLOT"
+    echo "c4_slot=$C4_SLOT"; echo "c5_slot=$C5_SLOT"; echo "c6_slot=$C6_SLOT"
+    echo "master=$MASTER"; echo "links_url=$LINKS_URL";
+    echo "report=$REPORT"; echo "device_name=$DEVICE_NAME"; echo "report_url=$REPORT_URL";   echo "split_mode=$SPLIT_MODE"
     echo "chunk=$CHUNK";     echo "load_wait=$LOAD_WAIT"
     echo "hold_time=$HOLD_TIME"; echo "stagger=$STAGGER"
     echo "launch_tmpl=$LAUNCH_TMPL"
@@ -177,7 +193,7 @@ reload_master(){
 update_links(){
   printf '\n %ssyncing links from repo...%s\n' "$C_DIM" "$C_RESET"
   local tmp; tmp="$(mktemp 2>/dev/null)"; [ -n "$tmp" ] || tmp="$CONF_DIR/.lpull"
-  if curl -fsSL "$REPO_RAW/links.txt" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+  if curl -fsSL "$LINKS_URL" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
     mkdir -p "$(dirname "$MASTER")"
     if [ ! -f "$MASTER" ] || ! cmp -s "$tmp" "$MASTER"; then
       cp "$tmp" "$MASTER"; reload_master; flash "links updated: $MASTER_N"
@@ -247,6 +263,7 @@ log(){                     # $1=level $2=msg
   local ts; ts=$(date +'%-I:%M%p' 2>/dev/null || date +'%I:%M%p')
   LOG+=("$ts|$1|$2")
   [ ${#LOG[@]} -gt 200 ] && LOG=("${LOG[@]: -200}")
+  dirty=1
   case $1 in ERRO|FATA) toast "$2";; esac
 }
 print_log_line(){
@@ -300,19 +317,27 @@ render_settings(){
   hdr "rfhop  settings" "saturnity"
   rule
   local cv; if [ "$SPLIT_MODE" = auto ]; then cv="(auto)"; else cv="$CHUNK"; fi
-  printf ' %s%s1%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "clone1 package" "$C_RESET" "$(sv "${C1_PKG:-none}")"
-  printf ' %s%s2%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "clone1 slot"    "$C_RESET" "$(sv "$C1_SLOT")"
-  printf ' %s%s3%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "clone2 package" "$C_RESET" "$(sv "${C2_PKG:-none}")"
-  printf ' %s%s4%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "clone2 slot"    "$C_RESET" "$(sv "$C2_SLOT")"
-  printf ' %s%s5%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "master file"    "$C_RESET" "$(sv "${MASTER##*/}")"
-  printf ' %s%s6%s  %s%-15s%s %s%s%s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "split mode" "$C_RESET" "$C_GRN" "$SPLIT_MODE" "$C_RESET"
-  printf ' %s%s7%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "links per slot" "$C_RESET" "$(sv "$cv")"
+  local _c
+  for _c in $(seq 1 $NCLONES); do
+    local _pv="C${_c}_PKG" _slv="C${_c}_SLOT" _pk
+    _pk=${!_pv}; if [ -z "$_pk" ]; then _pk="(none)"; else _pk=${_pk##*.}; fi
+    printf ' %s%s%d%s  %s%-8s%s %-14s %sslot %s%s\n' \
+      "$C_BRAND" "$B" "$_c" "$C_RESET" "$C_WHT" "clone$_c" "$C_RESET" \
+      "$(sv "$_pk")" "$C_DIM" "${!_slv}" "$C_RESET"
+  done
+  printf ' %s%s7%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "master file"    "$C_RESET" "$(sv "${MASTER##*/}")"
+  printf ' %s%sU%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "links url"      "$C_RESET" "$(sv "${LINKS_URL##*/}")"
   printf ' %s%s8%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "load wait"      "$C_RESET" "$(sv "${LOAD_WAIT}s")"
   printf ' %s%s9%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "hold time"      "$C_RESET" "$(sv "${HOLD_TIME}s")"
-  printf ' %s%sG%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "stagger clone2" "$C_RESET" "$(sv "${STAGGER}s")"
+  printf ' %s%sM%s  %s%-15s%s %s%s%s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "split mode" "$C_RESET" "$C_GRN" "$SPLIT_MODE" "$C_RESET"
+  printf ' %s%sC%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "links per slot" "$C_RESET" "$(sv "$cv")"
+  printf ' %s%sG%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "stagger step"   "$C_RESET" "$(sv "${STAGGER}s")"
   printf ' %s%sL%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "launch tmpl"    "$C_RESET" "$(sv "$LAUNCH_TMPL")"
   printf ' %s%sW%s  %s%-15s%s %s%s%s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "wakelock" "$C_RESET" "$([ "$WAKELOCK" = on ] && echo "$C_GRN" || echo "$C_DIM")" "$WAKELOCK" "$C_RESET"
   printf ' %s%sA%s  %s%-15s%s %s%s%s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "termux-api" "$C_RESET" "$([ "$TERMUX_API" = on ] && echo "$C_GRN" || echo "$C_DIM")" "$TERMUX_API" "$C_RESET"
+  printf ' %s%sN%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "device name"    "$C_RESET" "$(sv "${DEVICE_NAME:-none}")"
+  printf ' %s%sR%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "report url"     "$C_RESET" "$(sv "${REPORT_URL:-none}")"
+  printf ' %s%sY%s  %s%-15s%s %s%s%s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "reporting" "$C_RESET" "$([ "$REPORT" = on ] && echo "$C_GRN" || echo "$C_DIM")" "$REPORT" "$C_RESET"
   printf ' %s%sT%s  %s%s%s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "test launch clone1" "$C_RESET"
   rule
   printf ' %s%sS%s %ssave%s   %s%s0%s %sback%s   %sapplies on next start%s ' \
@@ -332,6 +357,10 @@ edit_val(){                # $1=varname $2=prompt $3=type(int|str)
   case $1 in LOAD_WAIT|HOLD_TIME|CHUNK) [ "$V" -lt 1 ] && V=1;; esac
 }
 
+edit_clone(){              # $1 = clone number: pick package, then set its slot
+  edit_pkg "$1"
+  edit_val "C${1}_SLOT" "clone$1 slot (1-$NSLOTS)" int
+}
 edit_pkg(){                # $1 = clone number
   detect_pkgs
   show_cursor; cook; clr
@@ -340,7 +369,7 @@ edit_pkg(){                # $1 = clone number
     printf ' %sno roblox packages detected.%s\n' "$C_YEL" "$C_RESET"
     printf ' %stype a package name manually:%s\n %s>%s ' "$C_DIM" "$C_RESET" "$C_BRAND" "$C_RESET"
     local m; IFS= read -r m
-    [ -n "$m" ] && { [ "$1" = 1 ] && C1_PKG=$m || C2_PKG=$m; }
+    [ -n "$m" ] && printf -v "C${1}_PKG" '%s' "$m"
     return
   fi
   local i
@@ -352,7 +381,7 @@ edit_pkg(){                # $1 = clone number
   local k; read -rsn2 k
   case $k in ''|*[!0-9]*) return;; esac
   [ "$k" -ge 1 ] && [ "$k" -le ${#PKGS[@]} ] || return
-  if [ "$1" = 1 ]; then C1_PKG=${PKGS[$((k-1))]}; else C2_PKG=${PKGS[$((k-1))]}; fi
+  printf -v "C${1}_PKG" '%s' "${PKGS[$((k-1))]}"
 }
 
 screen_test(){
@@ -381,19 +410,20 @@ screen_settings(){
     show_cursor; cook
     local k; read -rsn1 k
     case $k in
-      1) edit_pkg 1;;
-      2) edit_val C1_SLOT "clone1 slot (1-$NSLOTS)" int;;
-      3) edit_pkg 2;;
-      4) edit_val C2_SLOT "clone2 slot (1-$NSLOTS)" int;;
-      5) edit_val MASTER "master file path" str; reload_master;;
-      6) [ "$SPLIT_MODE" = auto ] && SPLIT_MODE=fixed || SPLIT_MODE=auto;;
-      7) if [ "$SPLIT_MODE" = fixed ]; then edit_val CHUNK "links per slot" int; else flash "links per slot only applies in fixed mode"; fi;;
+      [1-6]) edit_clone "$k";;
+      7) edit_val MASTER "master file path" str; reload_master;;
+      u|U) edit_val LINKS_URL "links url (raw github .txt)" str;;
       8) edit_val LOAD_WAIT "load wait seconds" int;;
       9) edit_val HOLD_TIME "hold time seconds" int;;
-      g|G) edit_val STAGGER "clone2 stagger seconds" int;;
+      m|M) [ "$SPLIT_MODE" = auto ] && SPLIT_MODE=fixed || SPLIT_MODE=auto;;
+      c|C) if [ "$SPLIT_MODE" = fixed ]; then edit_val CHUNK "links per slot" int; else flash "links per slot only applies in fixed mode"; fi;;
+      g|G) edit_val STAGGER "stagger step seconds" int;;
       l|L) edit_val LAUNCH_TMPL "launch template (%PKG% %URL%)" str;;
       w|W) [ "$WAKELOCK" = on ] && WAKELOCK=off || WAKELOCK=on;;
       a|A) [ "$TERMUX_API" = on ] && TERMUX_API=off || TERMUX_API=on;;
+      n|N) edit_val DEVICE_NAME "device name (e.g. RF01)" str;;
+      r|R) edit_val REPORT_URL "worker /report url" str;;
+      y|Y) [ "$REPORT" = on ] && REPORT=off || REPORT=on;;
       t|T) screen_test;;
       s|S) save_cfg; flash "saved";;
       0) return;;
@@ -404,14 +434,14 @@ screen_settings(){
 # ============================================================================
 #  RUN LOOP  (the live dashboard)
 # ============================================================================
-idx1=-1; idx2=-1; ph1=NONE; ph2=NONE; te1=0; te2=0
+idx1=-1;idx2=-1;idx3=-1;idx4=-1;idx5=-1;idx6=-1; ph1=NONE;ph2=NONE;ph3=NONE;ph4=NONE;ph5=NONE;ph6=NONE; te1=0;te2=0;te3=0;te4=0;te5=0;te6=0; lh1=0;lh2=0;lh3=0;lh4=0;lh5=0;lh6=0; sn1=0;sn2=0;sn3=0;sn4=0;sn5=0;sn6=0; dirty=1
 c1_links=(); c2_links=()
 hops=0; wraps=0; paused=0; t0=0
 
 advance(){                 # $1 = clone number  (a hop: stop -> next link -> launch)
   local c=$1
   local -n IDX=idx$c TE=te$c PH=ph$c LINKS=c${c}_links
-  local pkg; [ "$c" = 1 ] && pkg=$C1_PKG || pkg=$C2_PKG
+  local pkg; pkg=$(pkg_of "$c")
   local n=${#LINKS[@]}
   [ "$n" -eq 0 ] && { PH=NONE; return; }
   stop_clone "$pkg"
@@ -419,17 +449,16 @@ advance(){                 # $1 = clone number  (a hop: stop -> next link -> lau
   IDX=$(( (IDX+1) % n ))
   local hu=$((IDX+1))
   if [ "$prev" -lt 0 ]; then
-    log INFO "clone$c start link $hu/$n"
+    log INFO "clone$c open link $hu/$n"
   else
     if [ "$IDX" -eq 0 ]; then wraps=$((wraps+1)); log WARN "clone$c slot end -> wrap to 01"; fi
     log INFO "clone$c hop $((prev+1))->$hu"
   fi
-  log DEBU "am ${pkg##*.}/..ProtocolLaunch"
   if ! launch_clone "$pkg" "${LINKS[$IDX]}"; then
     log ERRO "clone$c launch failed: $(printf '%s' "$LAST_OUT" | tail -1)"
   fi
-  PH=LOAD; TE=$(( $(now) + LOAD_WAIT ))
-  log INFO "clone$c launching, settle ${LOAD_WAIT}s"
+  PH=LOAD; TE=$(( $(now) + LOAD_WAIT )); set_since "$c"
+  case $c in 1) lh1=$(now);; 2) lh2=$(now);; 3) lh3=$(now);; esac
   [ "$prev" -ge 0 ] && hops=$((hops+1))
 }
 
@@ -441,7 +470,7 @@ tickphase(){               # $1 = clone number
   if [ "$T" -ge "$TE" ]; then
     case $PH in
       WAIT) advance "$c" ;;
-      LOAD) PH=HOLD; TE=$(( T + HOLD_TIME )); log INFO "clone$c holding ${HOLD_TIME}s" ;;
+      LOAD) PH=HOLD; TE=$(( T + HOLD_TIME )); set_since "$c"; log INFO "clone$c joined, hold ${HOLD_TIME}s" ;;
       HOLD) advance "$c" ;;
     esac
   fi
@@ -450,14 +479,13 @@ tickphase(){               # $1 = clone number
 clone_line(){              # $1 = clone number
   local c=$1
   local -n IDX=idx$c PH=ph$c TE=te$c LINKS=c${c}_links
-  local pkg; [ "$c" = 1 ] && pkg=$C1_PKG || pkg=$C2_PKG
+  local pkg; pkg=$(pkg_of "$c")
   local short=${pkg##*.} n=${#LINKS[@]}
-  local rem=$(( TE - $(now) )); [ $rem -lt 0 ] && rem=0
   local dot tagcol tag s2 linktxt
   case $PH in
-    HOLD) dot=$C_GRN; tagcol=$C_GRN; tag=HOLD; s2="in server · next hop $(fmt_dur $rem)";;
-    LOAD) dot=$C_YEL; tagcol=$C_YEL; tag=LOAD; s2="launching · ready in ${rem}s";;
-    WAIT) dot=$C_YEL; tagcol=$C_DIM; tag=WAIT; s2="queued · starts in ${rem}s";;
+    HOLD) dot=$C_GRN; tagcol=$C_GRN; tag=HOLD; s2="in server · next hop $(fmt_clock $TE)";;
+    LOAD) dot=$C_YEL; tagcol=$C_YEL; tag=LOAD; s2="opening · joins ~$(fmt_clock $TE)";;
+    WAIT) dot=$C_YEL; tagcol=$C_DIM; tag=WAIT; s2="queued · opens $(fmt_clock $TE)";;
     *)    dot=$C_DIM; tagcol=$C_DIM; tag=IDLE; s2="empty slot";;
   esac
   if [ "$PH" = NONE ]; then
@@ -475,11 +503,12 @@ clone_line(){              # $1 = clone number
 
 render_run(){
   fit; clr
+  local nc=0 c phv
+  for c in $(seq 1 $NCLONES); do phv="ph$c"; [ "${!phv}" != NONE ] && nc=$((nc+1)); done
   hdr "rfhop  v$VERSION" "saturnity"
-  printf '%sredfinger · 2 clones · %s%s\n' "$C_DIM" "$(mode_label)" "$C_RESET"
+  printf '%sredfinger · %d clone%s · %s%s\n' "$C_DIM" "$nc" "$([ "$nc" = 1 ] && echo '' || echo s)" "$(mode_label)" "$C_RESET"
   rule
-  clone_line 1
-  clone_line 2
+  for c in $(seq 1 $NCLONES); do phv="ph$c"; [ "${!phv}" != NONE ] && clone_line "$c"; done
   rule
   printf ' %scycle%s  %s%ss load + %ss hold%s   %sstagger%s %s%ss%s\n' \
     "$C_DIM" "$C_RESET" "$C_WHT" "$LOAD_WAIT" "$HOLD_TIME" "$C_RESET" "$C_DIM" "$C_RESET" "$C_WHT" "$STAGGER" "$C_RESET"
@@ -489,47 +518,130 @@ render_run(){
     "$C_DIM" "$C_RESET" "$C_WHT" "$hops" "$C_RESET" \
     "$C_DIM" "$C_RESET" "$C_WHT" "$wraps" "$C_RESET"
   rule
-  local i start=$(( ${#LOG[@]} - 6 )); [ $start -lt 0 ] && start=0
+  local i start=$(( ${#LOG[@]} - 8 )); [ $start -lt 0 ] && start=0
   for (( i=start; i<${#LOG[@]}; i++ )); do print_log_line "${LOG[$i]}"; done
   rule
   if [ "$paused" -eq 1 ]; then
-    printf ' %s%sPAUSED%s   %sP%s resume   %s1%s/%s2%s hop   %sQ%s quit\n' \
-      "$C_YEL" "$B" "$C_RESET" "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf ' %s%sPAUSED%s   %sP%s resume   %shop%s %s1-%s%s   %sQ%s quit\n' \
+      "$C_YEL" "$B" "$C_RESET" "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET" "$C_WHT" "$nc" "$C_RESET" "$C_DIM" "$C_RESET"
   else
-    printf ' %sP%s pause   %s1%s hop c1   %s2%s hop c2   %sQ%s quit\n' \
-      "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf ' %sP%s pause   %shop%s %s1-%s%s   %sQ%s quit\n' \
+      "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET" "$C_WHT" "$nc" "$C_RESET" "$C_DIM" "$C_RESET"
   fi
 }
 
+# ---- discord dashboard reporting (via cloudflare worker) -------------------
+# resolve "username|userId" from a clone's ROBLOSECURITY cookie (cached per pkg).
+# returns empty if logged out or the cookie value is encrypted/unreadable.
+resolve_acct(){            # $1=pkg
+  local pkg=$1 cache="$CONF_DIR/acct_$pkg"
+  [ -f "$cache" ] && { cat "$cache"; return; }
+  local db="/data/data/$pkg/app_webview/Default/Cookies"
+  local ck; ck=$(su -c "$SQLITE '$db' \"SELECT value FROM cookies WHERE name LIKE '%ROBLOSECURITY%' AND length(value)>0 LIMIT 1;\"" 2>/dev/null)
+  [ -n "$ck" ] || return 0
+  local j; j=$(curl -fsS -m 8 'https://users.roblox.com/v1/users/authenticated' -H "Cookie: .ROBLOSECURITY=$ck" 2>/dev/null)
+  local uid name
+  uid=$(printf '%s' "$j" | grep -oE '"id":[0-9]+' | head -1 | grep -oE '[0-9]+')
+  name=$(printf '%s' "$j" | grep -oE '"name":"[^"]*"' | head -1 | sed 's/.*"name":"//; s/".*//')
+  [ -n "$uid" ] || return 0
+  printf '%s|%s' "$name" "$uid" | tee "$cache"
+}
+
+# presence-based status for a userId; falls back to $2 if unavailable.
+# userPresenceType: 0 offline · 1 online(not in game = captcha/menu) · 2 in game
+presence_status(){        # $1=userId $2=fallback  (cached with TTL to avoid rate-limits)
+  local uid=$1 fb=$2
+  [ -n "$uid" ] || { printf '%s' "$fb"; return; }
+  local cache="$CONF_DIR/pres_$uid" ttl=${PRESENCE_TTL:-30} nowt ts val
+  nowt=$(now)
+  if [ -f "$cache" ]; then
+    IFS='|' read -r ts val < "$cache"
+    [ -n "$ts" ] && [ $(( nowt - ts )) -lt "$ttl" ] && { printf '%s' "$val"; return; }
+  fi
+  local j; j=$(curl -fsS -m 8 'https://presence.roblox.com/v1/presence/users' \
+        -H 'content-type: application/json' -d "{\"userIds\":[$uid]}" 2>/dev/null)
+  local t; t=$(printf '%s' "$j" | grep -oE '"userPresenceType":[0-9]+' | head -1 | grep -oE '[0-9]+$')
+  local out
+  case $t in
+    2) out='in game';;
+    1) out='captcha';;
+    0) out='dead';;
+    *) out=$fb;;
+  esac
+  printf '%s|%s' "$nowt" "$out" > "$cache" 2>/dev/null
+  printf '%s' "$out"
+}
+
+# build one clone's JSON object
+set_since(){              # $1=clone number -> stamp when this clone entered its phase
+  case $1 in 1) sn1=$(now);; 2) sn2=$(now);; 3) sn3=$(now);; 4) sn4=$(now);; 5) sn5=$(now);; 6) sn6=$(now);; esac
+}
+
+clone_json(){             # $1=clone number
+  local c=$1
+  local phv="ph$c" idxv="idx$c" lhv="lh$c" snv="sn$c" lv="c${c}_links[@]"
+  local PH=${!phv} IDX=${!idxv} LH=${!lhv} SN=${!snv}
+  local pkg; pkg=$(pkg_of "$c")
+  [ -n "$pkg" ] || return 1
+  local links=( ${!lv} ) n=${#links[@]} link=0
+  [ "$IDX" -ge 0 ] && link=$((IDX+1))
+  local st; case $PH in HOLD) st="in game";; LOAD) st="joining";; WAIT) st="queued";; *) st="dead";; esac
+  local user="" uid="" acct; acct=$(resolve_acct "$pkg"); user=${acct%%|*}; uid=${acct##*|}
+  [ "$user" = "$uid" ] && user=""
+  # refine HOLD -> real presence (captcha detection) when we know the userId
+  [ "$PH" = HOLD ] && [ -n "$uid" ] && st=$(presence_status "$uid" "in game")
+  user=${user//\"/}       # sanitise for JSON
+  printf '{"pkg":"%s","user":"%s","link":%d,"max":%d,"status":"%s","lastHop":%d,"since":%d}' \
+    "${pkg##*.}" "$user" "$link" "$n" "$st" "${LH:-0}" "${SN:-0}"
+}
+
+# POST current state to the worker (backgrounded so it never blocks the loop)
+report_state(){
+  [ "$REPORT" = on ] && [ -n "$REPORT_URL" ] && [ -n "$DEVICE_NAME" ] || return 0
+  local tsf="$CONF_DIR/.report_ts" nowt lt; nowt=$(now)
+  lt=$(cat "$tsf" 2>/dev/null || echo 0)
+  [ $(( nowt - lt )) -lt "${REPORT_MIN:-8}" ] && return 0   # throttle: at most one report / 8s
+  echo "$nowt" > "$tsf" 2>/dev/null
+  { local parts=() c j
+    for c in $(seq 1 $NCLONES); do j=$(clone_json "$c") && parts+=("$j"); done
+    local body clones; clones=$(IFS=,; echo "${parts[*]}")
+    body="{\"device\":\"$DEVICE_NAME\",\"hops\":${hops:-0},\"wraps\":${wraps:-0},\"clones\":[$clones]}"
+    curl -fsS -m 10 -X POST "$REPORT_URL" -H 'content-type: application/json' -d "$body" >/dev/null 2>&1
+  } &
+}
+setup_clone(){             # $1 = clone number  (build links + init phase, staggered)
+  local c=$1 pkg; pkg=$(pkg_of "$c")
+  local -n LK=c${c}_links PH=ph$c TE=te$c IDX=idx$c LH=lh$c
+  LK=(); IDX=-1; LH=0
+  if [ -z "$pkg" ]; then PH=NONE; return; fi
+  local l; while IFS= read -r l; do LK+=("$l"); done < <(slot_links "$(slot_of "$c")")
+  if [ ${#LK[@]} -gt 0 ]; then PH=WAIT; TE=$(( $(now) + (c-1)*STAGGER )); set_since "$c"; else PH=NONE; log WARN "clone$c slot $(slot_of "$c") empty"; fi
+}
 run_loop(){
   reload_master
-  if [ "$MASTER_N" -eq 0 ]; then flash "no links loaded - set master file (settings, 5)"; return; fi
-  if [ -z "$C1_PKG" ] && [ -z "$C2_PKG" ]; then flash "set clone packages in settings (1 and 3)"; return; fi
+  if [ "$MASTER_N" -eq 0 ]; then flash "no links loaded - set master file (settings, 7)"; return; fi
+  local _any="" _c
+  for _c in $(seq 1 $NCLONES); do [ -n "$(pkg_of $_c)" ] && _any=1; done
+  [ -z "$_any" ] && { flash "set at least one clone package in settings"; return; }
 
-  local l
-  c1_links=(); while IFS= read -r l; do c1_links+=("$l"); done < <(slot_links "$C1_SLOT")
-  c2_links=(); while IFS= read -r l; do c2_links+=("$l"); done < <(slot_links "$C2_SLOT")
+  hops=0; wraps=0; paused=0; t0=$(now); LOG=(); dirty=1; local last_report=0
+  local c; for c in $(seq 1 $NCLONES); do setup_clone "$c"; done
 
-  idx1=-1; idx2=-1; hops=0; wraps=0; paused=0; t0=$(now); LOG=()
-  if [ ${#c1_links[@]} -gt 0 ]; then ph1=WAIT; te1=$(now); else ph1=NONE; log WARN "clone1 slot $C1_SLOT empty"; fi
-  if [ ${#c2_links[@]} -gt 0 ]; then ph2=WAIT; te2=$(( $(now) + STAGGER )); else ph2=NONE; log WARN "clone2 slot $C2_SLOT empty"; fi
 
   wake_on; hide_cursor
   local key
   while :; do
     if [ "$paused" -eq 0 ]; then
-      tickphase 1
-      tickphase 2
+      for c in $(seq 1 $NCLONES); do tickphase "$c"; done
     else
-      [ "$ph1" != NONE ] && te1=$((te1+1))
-      [ "$ph2" != NONE ] && te2=$((te2+1))
+      for c in $(seq 1 $NCLONES); do phv="ph$c"; tev="te$c"; [ "${!phv}" != NONE ] && printf -v "$tev" '%d' "$(( ${!tev} + 1 ))"; done
     fi
-    render_run
+    [ "$dirty" -eq 1 ] && { render_run; dirty=0; report_state; last_report=$(now); }
+    if [ $(( $(now) - last_report )) -ge 25 ]; then report_state; last_report=$(now); fi
     if read -rsn1 -t 1 key; then
       case $key in
         p|P) [ "$paused" -eq 1 ] && { paused=0; log INFO "resumed"; } || { paused=1; log INFO "paused"; } ;;
-        1)   [ "$ph1" != NONE ] && advance 1 ;;
-        2)   [ "$ph2" != NONE ] && advance 2 ;;
+        [1-6]) phv="ph$key"; [ "${!phv}" != NONE ] && advance "$key" ;;
         q|Q|0) break ;;
       esac
     fi
