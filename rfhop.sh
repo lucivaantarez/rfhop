@@ -16,7 +16,7 @@
 
 shopt -s checkwinsize 2>/dev/null
 
-VERSION="2.7.0"
+VERSION="2.9.0"
 NSLOTS=40
 
 CONF_DIR="$HOME/.rfhop"
@@ -24,7 +24,7 @@ CONF="$CONF_DIR/config"
 
 # ---- defaults (overridden by config) --------------------------------------
 NCLONES=4                  # clones per device; leave a clone's package blank to skip it
-C1_PKG="com.roblox.clienv"; C2_PKG="com.roblox.clienx"; C3_PKG="com.roblox.clienw"; C4_PKG="com.roblox.clieny"; C5_PKG=""; C6_PKG=""
+C1_PKG="com.roblox.clienv"; C2_PKG="com.roblox.clienw"; C3_PKG="com.roblox.clienx"; C4_PKG="com.roblox.clieny"; C5_PKG=""; C6_PKG=""
 C1_SLOT=1; C2_SLOT=2; C3_SLOT=3; C4_SLOT=4; C5_SLOT=5; C6_SLOT=6
 pkg_of(){  local v="C${1}_PKG";  printf '%s' "${!v}"; }
 slot_of(){ local v="C${1}_SLOT"; printf '%s' "${!v}"; }
@@ -338,6 +338,7 @@ render_settings(){
   printf ' %s%sN%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "device name"    "$C_RESET" "$(sv "${DEVICE_NAME:-none}")"
   printf ' %s%sR%s  %s%-15s%s %s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "report url"     "$C_RESET" "$(sv "${REPORT_URL:-none}")"
   printf ' %s%sY%s  %s%-15s%s %s%s%s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "reporting" "$C_RESET" "$([ "$REPORT" = on ] && echo "$C_GRN" || echo "$C_DIM")" "$REPORT" "$C_RESET"
+  printf ' %s%sX%s  %s%s%s\n' "$C_BRAND" "$B" "$C_RESET" "$C_DIM" "reset to defaults" "$C_RESET"
   printf ' %s%sT%s  %s%s%s\n' "$C_BRAND" "$B" "$C_RESET" "$C_WHT" "test launch clone1" "$C_RESET"
   rule
   printf ' %s%sS%s %ssave%s   %s%s0%s %sback%s   %sapplies on next start%s ' \
@@ -404,6 +405,33 @@ screen_test(){
   read -r _
 }
 
+reset_defaults(){         # wipe config and restore shipped defaults
+  clr; hdr "rfhop  reset" "saturnity"; rule
+  printf ' %sthis clears this device'"'"'s saved settings%s\n' "$C_WHT" "$C_RESET"
+  printf ' %spackages, slots, device name, report url, timings%s\n\n' "$C_DIM" "$C_RESET"
+  show_cursor; cook
+  printf ' %stype%s %sRESET%s %sto confirm, anything else cancels:%s ' \
+    "$C_DIM" "$C_RESET" "$C_YEL$B" "$C_RESET" "$C_DIM" "$C_RESET"
+  local ans; IFS= read -r ans
+  hide_cursor
+  if [ "$ans" != "RESET" ]; then flash "cancelled"; return; fi
+  rm -f "$CONF" 2>/dev/null
+  rm -f "$CONF_DIR"/acct_* "$CONF_DIR"/pres_* 2>/dev/null   # cached accounts/presence too
+  # restore shipped defaults
+  NCLONES=4
+  C1_PKG="com.roblox.clienv"; C2_PKG="com.roblox.clienw"
+  C3_PKG="com.roblox.clienx"; C4_PKG="com.roblox.clieny"
+  C5_PKG=""; C6_PKG=""
+  C1_SLOT=1; C2_SLOT=2; C3_SLOT=3; C4_SLOT=4; C5_SLOT=5; C6_SLOT=6
+  MASTER="$CONF_DIR/links.txt"
+  LINKS_URL="https://raw.githubusercontent.com/lucivaantarez/rfhop/main/links.txt"
+  SPLIT_MODE="auto"; CHUNK=50
+  LOAD_WAIT=20; HOLD_TIME=180; STAGGER=100
+  WAKELOCK="on"; TERMUX_API="off"
+  REPORT="off"; DEVICE_NAME=""; REPORT_URL=""
+  flash "reset to defaults - set slots + device name, then S to save"
+}
+
 screen_settings(){
   while :; do
     render_settings
@@ -424,6 +452,7 @@ screen_settings(){
       n|N) edit_val DEVICE_NAME "device name (e.g. RF01)" str;;
       r|R) edit_val REPORT_URL "worker /report url" str;;
       y|Y) [ "$REPORT" = on ] && REPORT=off || REPORT=on;;
+      x|X) reset_defaults;;
       t|T) screen_test;;
       s|S) save_cfg; flash "saved";;
       0) return;;
@@ -438,6 +467,14 @@ idx1=-1;idx2=-1;idx3=-1;idx4=-1;idx5=-1;idx6=-1; ph1=NONE;ph2=NONE;ph3=NONE;ph4=
 c1_links=(); c2_links=()
 hops=0; wraps=0; paused=0; t0=0
 
+set_lasthop(){            # $1=clone number -> stamp last hop time
+  case $1 in 1) lh1=$(now);; 2) lh2=$(now);; 3) lh3=$(now);; 4) lh4=$(now);; 5) lh5=$(now);; 6) lh6=$(now);; esac
+}
+
+set_since(){              # $1=clone number -> stamp when this clone entered its phase
+  case $1 in 1) sn1=$(now);; 2) sn2=$(now);; 3) sn3=$(now);; 4) sn4=$(now);; 5) sn5=$(now);; 6) sn6=$(now);; esac
+}
+
 advance(){                 # $1 = clone number  (a hop: stop -> next link -> launch)
   local c=$1
   local -n IDX=idx$c TE=te$c PH=ph$c LINKS=c${c}_links
@@ -448,18 +485,86 @@ advance(){                 # $1 = clone number  (a hop: stop -> next link -> lau
   local prev=$IDX
   IDX=$(( (IDX+1) % n ))
   local hu=$((IDX+1))
+  local url="${LINKS[$IDX]}" tag=""
   if [ "$prev" -lt 0 ]; then
     log INFO "clone$c open link $hu/$n"
   else
-    if [ "$IDX" -eq 0 ]; then wraps=$((wraps+1)); log WARN "clone$c slot end -> wrap to 01"; fi
-    log INFO "clone$c hop $((prev+1))->$hu"
+    if [ "$IDX" -eq 0 ]; then
+      wraps=$((wraps+1))
+      # finished my own slot -> if I'm covering a stuck clone, sweep its slot now
+      local orph; orph=$(get_i ov "$c")
+      if [ "$orph" != 0 ]; then
+        local -n OL=c${orph}_links
+        local on=${#OL[@]}
+        if [ "$on" -gt 0 ]; then
+          local oi; oi=$(( $(get_i sweep "$c") % on ))
+          url="${OL[$oi]}"; tag=" (sweeping clone$orph $((oi+1))/$on)"
+          set_i sweep "$c" $(( oi + 1 ))
+          [ $(( oi + 1 )) -ge "$on" ] && set_i sweep "$c" 0
+        fi
+      else
+        log WARN "clone$c slot end -> wrap to 01"
+      fi
+    fi
+    log INFO "clone$c hop $((prev+1))->$hu$tag"
   fi
-  if ! launch_clone "$pkg" "${LINKS[$IDX]}"; then
+  if ! launch_clone "$pkg" "$url"; then
     log ERRO "clone$c launch failed: $(printf '%s' "$LAST_OUT" | tail -1)"
   fi
   PH=LOAD; TE=$(( $(now) + LOAD_WAIT )); set_since "$c"
-  case $c in 1) lh1=$(now);; 2) lh2=$(now);; 3) lh3=$(now);; esac
-  [ "$prev" -ge 0 ] && hops=$((hops+1))
+  set_lasthop "$c"
+}
+
+# ---- captcha takeover: a stuck clone's slot is swept by a healthy sibling -----
+# stk<c> = consecutive failed join checks   ov<c> = clone number whose slot c is sweeping
+stk1=0;stk2=0;stk3=0;stk4=0;stk5=0;stk6=0
+ov1=0;ov2=0;ov3=0;ov4=0;ov5=0;ov6=0
+sweep1=0;sweep2=0;sweep3=0;sweep4=0;sweep5=0;sweep6=0
+RETRY_CAP=${RETRY_CAP:-3}          # failed checks before the slot is handed over
+
+get_i(){ local v="$1$2"; echo "${!v:-0}"; }          # get_i stk 3  -> $stk3
+set_i(){ eval "$1$2=$3"; }                            # set_i stk 3 1
+
+# is this clone actually in game? uses the cached presence check
+clone_in_game(){           # $1=clone number -> 0 yes / 1 no
+  local c=$1 pkg acct uid
+  pkg=$(pkg_of "$c"); [ -n "$pkg" ] || return 1
+  acct=$(resolve_acct "$pkg"); uid=${acct##*|}
+  [ -n "$uid" ] || return 0                           # no uid -> can't tell, assume ok
+  [ "$(presence_status "$uid" "in game")" = "in game" ]
+}
+
+# find a healthy clone that can sweep clone $1's slot (not already sweeping)
+find_sweeper(){            # $1 = orphaned clone number -> echoes clone number or nothing
+  local orphan=$1 c
+  for c in $(seq 1 "$NCLONES"); do
+    [ "$c" = "$orphan" ] && continue
+    local phv="ph$c"; [ "${!phv}" = NONE ] && continue
+    [ "$(get_i ov "$c")" != 0 ] && continue           # already covering something
+    [ "$(get_i stk "$c")" -ge "$RETRY_CAP" ] && continue   # itself stuck
+    echo "$c"; return 0
+  done
+}
+
+# give clone $1's slot to a healthy sibling (sequential: sweeper finishes its own first)
+hand_over(){               # $1 = stuck clone number
+  local orphan=$1
+  [ "$(get_i ov "$orphan")" != 0 ] && return           # already handed over
+  local sw; sw=$(find_sweeper "$orphan")
+  if [ -z "$sw" ]; then log WARN "clone$orphan stuck, no healthy clone free to sweep"; return; fi
+  set_i ov "$sw" "$orphan"
+  log WARN "clone$orphan stuck -> clone$sw will sweep its slot after its own"
+}
+
+# stuck clone recovered: pull its slot back from whoever was sweeping it
+reclaim_slot(){            # $1 = recovered clone number
+  local me=$1 c
+  for c in $(seq 1 "$NCLONES"); do
+    if [ "$(get_i ov "$c")" = "$me" ]; then
+      set_i ov "$c" 0
+      log INFO "clone$me recovered -> clone$c returns to its own slot"
+    fi
+  done
 }
 
 tickphase(){               # $1 = clone number
@@ -470,7 +575,19 @@ tickphase(){               # $1 = clone number
   if [ "$T" -ge "$TE" ]; then
     case $PH in
       WAIT) advance "$c" ;;
-      LOAD) PH=HOLD; TE=$(( T + HOLD_TIME )); set_since "$c"; log INFO "clone$c joined, hold ${HOLD_TIME}s" ;;
+      LOAD)
+        if clone_in_game "$c"; then
+          set_i stk "$c" 0
+          PH=HOLD; TE=$(( T + HOLD_TIME )); set_since "$c"
+          hops=$((hops+1))                              # only count confirmed joins
+          log INFO "clone$c joined, hold ${HOLD_TIME}s"
+          reclaim_slot "$c"                             # recovered -> take my slot back
+        else
+          local k; k=$(( $(get_i stk "$c") + 1 )); set_i stk "$c" "$k"
+          log WARN "clone$c not in game (try $k/$RETRY_CAP)"
+          [ "$k" -eq "$RETRY_CAP" ] && hand_over "$c"   # cap reached -> sibling sweeps my slot
+          PH=LOAD; TE=$(( T + 60 ))                     # keep rechecking this same link
+        fi ;;
       HOLD) advance "$c" ;;
     esac
   fi
@@ -573,10 +690,6 @@ presence_status(){        # $1=userId $2=fallback  (cached with TTL to avoid rat
 }
 
 # build one clone's JSON object
-set_since(){              # $1=clone number -> stamp when this clone entered its phase
-  case $1 in 1) sn1=$(now);; 2) sn2=$(now);; 3) sn3=$(now);; 4) sn4=$(now);; 5) sn5=$(now);; 6) sn6=$(now);; esac
-}
-
 clone_json(){             # $1=clone number
   local c=$1
   local phv="ph$c" idxv="idx$c" lhv="lh$c" snv="sn$c" lv="c${c}_links[@]"
