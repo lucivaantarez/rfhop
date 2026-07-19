@@ -16,7 +16,7 @@
 
 shopt -s checkwinsize 2>/dev/null
 
-VERSION="2.10.0"
+VERSION="2.12.0"
 NSLOTS=20
 
 CONF_DIR="$HOME/.rfhop"
@@ -418,7 +418,7 @@ reset_defaults(){         # wipe config and restore shipped defaults
   hide_cursor
   if [ "$ans" != "RESET" ]; then flash "cancelled"; return; fi
   rm -f "$CONF" 2>/dev/null
-  rm -f "$CONF_DIR"/acct_* "$CONF_DIR"/pres_* 2>/dev/null   # cached accounts/presence too
+  rm -f "$CONF_DIR"/acct_* "$CONF_DIR"/pres_* "$CONF_DIR"/ck_* 2>/dev/null   # cached accounts/presence too
   # restore shipped defaults
   NCLONES=2
   C1_PKG="com.roblox.clienv"; C2_PKG="com.roblox.clienw"
@@ -528,11 +528,12 @@ set_i(){ eval "$1$2=$3"; }                            # set_i stk 3 1
 
 # is this clone actually in game? uses the cached presence check
 clone_in_game(){           # $1=clone number -> 0 yes / 1 no
-  local c=$1 pkg acct uid
+  local c=$1 pkg acct uid ck
   pkg=$(pkg_of "$c"); [ -n "$pkg" ] || return 1
   acct=$(resolve_acct "$pkg"); uid=${acct##*|}
   [ -n "$uid" ] || return 0                           # no uid -> can't tell, assume ok
-  [ "$(presence_status "$uid" "in game")" = "in game" ]
+  ck=$(rbx_cookie "$pkg")                             # authenticate the presence call
+  [ "$(presence_status "$uid" "in game" "$ck")" = "in game" ]
 }
 
 # find a healthy clone that can sweep clone $1's slot (not already sweeping)
@@ -584,10 +585,16 @@ tickphase(){               # $1 = clone number
           log INFO "clone$c joined, hold ${HOLD_TIME}s"
           reclaim_slot "$c"                             # recovered -> take my slot back
         else
-          local k; k=$(( $(get_i stk "$c") + 1 )); set_i stk "$c" "$k"
+          local k; k=$(( $(get_i stk "$c") + 1 ))
+          [ "$k" -gt "$RETRY_CAP" ] && k=$RETRY_CAP     # clamp - never report try 11/3
+          set_i stk "$c" "$k"
           log WARN "clone$c not in game (try $k/$RETRY_CAP)"
-          [ "$k" -eq "$RETRY_CAP" ] && hand_over "$c"   # cap reached -> sibling sweeps my slot
-          PH=LOAD; TE=$(( T + 60 ))                     # keep rechecking this same link
+          if [ "$k" -ge "$RETRY_CAP" ]; then
+            hand_over "$c"                              # sibling sweeps my slot
+            PH=HOLD; TE=$(( T + HOLD_TIME ))            # stop hammering; recheck next cycle
+          else
+            PH=LOAD; TE=$(( T + 60 ))                   # retry same link in a minute
+          fi
         fi ;;
       HOLD) advance "$c" ;;
     esac
@@ -651,11 +658,20 @@ render_run(){
 # ---- discord dashboard reporting (via cloudflare worker) -------------------
 # resolve "username|userId" from a clone's ROBLOSECURITY cookie (cached per pkg).
 # returns empty if logged out or the cookie value is encrypted/unreadable.
+rbx_cookie(){              # $1=pkg -> echoes the .ROBLOSECURITY value (cached in memory per run)
+  local pkg=$1 cache="$CONF_DIR/ck_$pkg"
+  if [ -f "$cache" ]; then cat "$cache"; return; fi
+  local db="/data/data/$pkg/app_webview/Default/Cookies"
+  local ck; ck=$(su -c "$SQLITE '$db' \"SELECT value FROM cookies WHERE name LIKE '%ROBLOSECURITY%' AND length(value)>0 LIMIT 1;\"" 2>/dev/null)
+  [ -n "$ck" ] || return 0
+  printf '%s' "$ck" > "$cache" 2>/dev/null; chmod 600 "$cache" 2>/dev/null
+  printf '%s' "$ck"
+}
+
 resolve_acct(){            # $1=pkg
   local pkg=$1 cache="$CONF_DIR/acct_$pkg"
   [ -f "$cache" ] && { cat "$cache"; return; }
-  local db="/data/data/$pkg/app_webview/Default/Cookies"
-  local ck; ck=$(su -c "$SQLITE '$db' \"SELECT value FROM cookies WHERE name LIKE '%ROBLOSECURITY%' AND length(value)>0 LIMIT 1;\"" 2>/dev/null)
+  local ck; ck=$(rbx_cookie "$pkg")
   [ -n "$ck" ] || return 0
   local j; j=$(curl -fsS -m 8 'https://users.roblox.com/v1/users/authenticated' -H "Cookie: .ROBLOSECURITY=$ck" 2>/dev/null)
   local uid name
@@ -667,8 +683,8 @@ resolve_acct(){            # $1=pkg
 
 # presence-based status for a userId; falls back to $2 if unavailable.
 # userPresenceType: 0 offline · 1 online(not in game = captcha/menu) · 2 in game
-presence_status(){        # $1=userId $2=fallback  (cached with TTL to avoid rate-limits)
-  local uid=$1 fb=$2
+presence_status(){        # $1=userId $2=fallback $3=cookie  (cached, authenticated)
+  local uid=$1 fb=$2 ck=$3
   [ -n "$uid" ] || { printf '%s' "$fb"; return; }
   local cache="$CONF_DIR/pres_$uid" ttl=${PRESENCE_TTL:-30} nowt ts val
   nowt=$(now)
@@ -676,15 +692,23 @@ presence_status(){        # $1=userId $2=fallback  (cached with TTL to avoid rat
     IFS='|' read -r ts val < "$cache"
     [ -n "$ts" ] && [ $(( nowt - ts )) -lt "$ttl" ] && { printf '%s' "$val"; return; }
   fi
-  local j; j=$(curl -fsS -m 8 'https://presence.roblox.com/v1/presence/users' \
-        -H 'content-type: application/json' -d "{\"userIds\":[$uid]}" 2>/dev/null)
+  local j
+  if [ -n "$ck" ]; then
+    j=$(curl -fsS -m 8 'https://presence.roblox.com/v1/presence/users' \
+          -H 'content-type: application/json' -H "Cookie: .ROBLOSECURITY=$ck" \
+          -d "{\"userIds\":[$uid]}" 2>/dev/null)
+  else
+    j=$(curl -fsS -m 8 'https://presence.roblox.com/v1/presence/users' \
+          -H 'content-type: application/json' -d "{\"userIds\":[$uid]}" 2>/dev/null)
+  fi
+  # no response at all -> don't punish the clone, treat as fine
+  [ -z "$j" ] && { printf '%s' "$fb"; return; }
   local t; t=$(printf '%s' "$j" | grep -oE '"userPresenceType":[0-9]+' | head -1 | grep -oE '[0-9]+$')
   local out
   case $t in
     2) out='in game';;
     1) out='captcha';;
-    0) out='dead';;
-    *) out=$fb;;
+    *) out=$fb;;          # 0 or unknown -> fall back, never assume failure
   esac
   printf '%s|%s' "$nowt" "$out" > "$cache" 2>/dev/null
   printf '%s' "$out"
@@ -765,10 +789,10 @@ run_loop(){
 
 # ---- non-interactive setup: rfhop --setup RF01 1 2 [report_url] ---------------
 cli_setup(){
-  local dev=$1 s1=$2 s2=$3 url=$4
+  local dev=$1 s1=$2 s2=$3 url=$4 lw=$5 st=$6
   if [ -z "$dev" ] || [ -z "$s1" ] || [ -z "$s2" ]; then
-    printf 'usage:   rfhop --setup <device> <slot1> <slot2> [report_url]\n'
-    printf 'example: rfhop --setup RF01 1 2 https://saturnity-hop.susilobambangyowaimo.workers.dev/report\n'
+    printf 'usage:   rfhop --setup <device> <slot1> <slot2> [report_url] [load_wait] [stagger]\n'
+    printf 'example: rfhop --setup Alpha 1 2 https://your.workers.dev/report 20 5\n'
     return 1
   fi
   mkdir -p "$CONF_DIR"
@@ -778,10 +802,12 @@ cli_setup(){
   C1_PKG="com.roblox.clienv"; C2_PKG="com.roblox.clienw"
   C3_PKG=""; C4_PKG=""; C5_PKG=""; C6_PKG=""
   NCLONES=2
-  if [ -n "$url" ]; then REPORT_URL=$url; REPORT="on"; fi
+  [ -n "$url" ] && { REPORT_URL=$url; REPORT="on"; }
+  case ${lw:-} in ''|*[!0-9]*) : ;; *) LOAD_WAIT=$lw ;; esac
+  case ${st:-} in ''|*[!0-9]*) : ;; *) STAGGER=$st ;; esac
   save_cfg
-  printf '%s configured: clienv->slot %s, clienw->slot %s%s\n' \
-    "$dev" "$s1" "$s2" "$([ -n "$url" ] && printf ', reporting on' || printf '')"
+  printf '%s configured: clienv->slot %s, clienw->slot %s · load %ss · stagger %ss%s\n' \
+    "$dev" "$s1" "$s2" "$LOAD_WAIT" "$STAGGER" "$([ -n "$url" ] && printf ' · reporting on' || printf '')"
 }
 
 # ============================================================================
@@ -810,8 +836,8 @@ main(){
 if [ "${RFHOP_TEST:-}" != "1" ]; then
   case ${1:-} in
     --setup) shift; cli_setup "$@"; exit $? ;;
-    --show)  load_cfg 2>/dev/null; printf 'device=%s c1=%s slot %s · c2=%s slot %s · report=%s\n' \
-               "${DEVICE_NAME:-none}" "${C1_PKG##*.}" "$C1_SLOT" "${C2_PKG##*.}" "$C2_SLOT" "$REPORT"; exit 0 ;;
+    --show)  load_cfg 2>/dev/null; printf 'device=%s · c1=%s slot %s · c2=%s slot %s · load %ss · hold %ss · stagger %ss · report=%s\n' \
+               "${DEVICE_NAME:-none}" "${C1_PKG##*.}" "$C1_SLOT" "${C2_PKG##*.}" "$C2_SLOT" "$LOAD_WAIT" "$HOLD_TIME" "$STAGGER" "$REPORT"; exit 0 ;;
   esac
   main
 fi
