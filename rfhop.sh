@@ -16,15 +16,15 @@
 
 shopt -s checkwinsize 2>/dev/null
 
-VERSION="2.9.0"
-NSLOTS=40
+VERSION="2.10.0"
+NSLOTS=20
 
 CONF_DIR="$HOME/.rfhop"
 CONF="$CONF_DIR/config"
 
 # ---- defaults (overridden by config) --------------------------------------
-NCLONES=4                  # clones per device; leave a clone's package blank to skip it
-C1_PKG="com.roblox.clienv"; C2_PKG="com.roblox.clienw"; C3_PKG="com.roblox.clienx"; C4_PKG="com.roblox.clieny"; C5_PKG=""; C6_PKG=""
+NCLONES=2                  # clones per device; leave a clone's package blank to skip it
+C1_PKG="com.roblox.clienv"; C2_PKG="com.roblox.clienw"; C3_PKG=""; C4_PKG=""; C5_PKG=""; C6_PKG=""
 C1_SLOT=1; C2_SLOT=2; C3_SLOT=3; C4_SLOT=4; C5_SLOT=5; C6_SLOT=6
 pkg_of(){  local v="C${1}_PKG";  printf '%s' "${!v}"; }
 slot_of(){ local v="C${1}_SLOT"; printf '%s' "${!v}"; }
@@ -144,6 +144,7 @@ load_cfg(){
   local k v
   while IFS='=' read -r k v; do
     case $k in
+      nclones) NCLONES=$v;;
       c1_pkg) C1_PKG=$v;;  c2_pkg) C2_PKG=$v;;  c3_pkg) C3_PKG=$v;;
       c4_pkg) C4_PKG=$v;;  c5_pkg) C5_PKG=$v;;  c6_pkg) C6_PKG=$v;;
       c1_slot) C1_SLOT=$v;; c2_slot) C2_SLOT=$v;; c3_slot) C3_SLOT=$v;;
@@ -161,6 +162,7 @@ load_cfg(){
 save_cfg(){
   mkdir -p "$CONF_DIR"
   {
+    echo "nclones=$NCLONES"
     echo "c1_pkg=$C1_PKG";   echo "c2_pkg=$C2_PKG";   echo "c3_pkg=$C3_PKG"
     echo "c4_pkg=$C4_PKG";   echo "c5_pkg=$C5_PKG";   echo "c6_pkg=$C6_PKG"
     echo "c1_slot=$C1_SLOT"; echo "c2_slot=$C2_SLOT"; echo "c3_slot=$C3_SLOT"
@@ -418,10 +420,9 @@ reset_defaults(){         # wipe config and restore shipped defaults
   rm -f "$CONF" 2>/dev/null
   rm -f "$CONF_DIR"/acct_* "$CONF_DIR"/pres_* 2>/dev/null   # cached accounts/presence too
   # restore shipped defaults
-  NCLONES=4
+  NCLONES=2
   C1_PKG="com.roblox.clienv"; C2_PKG="com.roblox.clienw"
-  C3_PKG="com.roblox.clienx"; C4_PKG="com.roblox.clieny"
-  C5_PKG=""; C6_PKG=""
+  C3_PKG=""; C4_PKG=""; C5_PKG=""; C6_PKG=""
   C1_SLOT=1; C2_SLOT=2; C3_SLOT=3; C4_SLOT=4; C5_SLOT=5; C6_SLOT=6
   MASTER="$CONF_DIR/links.txt"
   LINKS_URL="https://raw.githubusercontent.com/lucivaantarez/rfhop/main/links.txt"
@@ -762,6 +763,27 @@ run_loop(){
   wake_off; show_cursor; cook
 }
 
+# ---- non-interactive setup: rfhop --setup RF01 1 2 [report_url] ---------------
+cli_setup(){
+  local dev=$1 s1=$2 s2=$3 url=$4
+  if [ -z "$dev" ] || [ -z "$s1" ] || [ -z "$s2" ]; then
+    printf 'usage:   rfhop --setup <device> <slot1> <slot2> [report_url]\n'
+    printf 'example: rfhop --setup RF01 1 2 https://saturnity-hop.susilobambangyowaimo.workers.dev/report\n'
+    return 1
+  fi
+  mkdir -p "$CONF_DIR"
+  load_cfg 2>/dev/null
+  DEVICE_NAME=$dev
+  C1_SLOT=$s1; C2_SLOT=$s2
+  C1_PKG="com.roblox.clienv"; C2_PKG="com.roblox.clienw"
+  C3_PKG=""; C4_PKG=""; C5_PKG=""; C6_PKG=""
+  NCLONES=2
+  if [ -n "$url" ]; then REPORT_URL=$url; REPORT="on"; fi
+  save_cfg
+  printf '%s configured: clienv->slot %s, clienw->slot %s%s\n' \
+    "$dev" "$s1" "$s2" "$([ -n "$url" ] && printf ', reporting on' || printf '')"
+}
+
 # ============================================================================
 #  MAIN
 # ============================================================================
@@ -785,4 +807,11 @@ main(){
   done
 }
 
-if [ "${RFHOP_TEST:-}" != "1" ]; then main; fi
+if [ "${RFHOP_TEST:-}" != "1" ]; then
+  case ${1:-} in
+    --setup) shift; cli_setup "$@"; exit $? ;;
+    --show)  load_cfg 2>/dev/null; printf 'device=%s c1=%s slot %s · c2=%s slot %s · report=%s\n' \
+               "${DEVICE_NAME:-none}" "${C1_PKG##*.}" "$C1_SLOT" "${C2_PKG##*.}" "$C2_SLOT" "$REPORT"; exit 0 ;;
+  esac
+  main
+fi
